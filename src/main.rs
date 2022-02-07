@@ -1,46 +1,71 @@
+use clap::Parser;
+use serde::{
+    de::{SeqAccess, Visitor},
+    ser::SerializeTuple,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use std::{
-    // collections::HashMap,
     io::{stdin, Read},
+    path::PathBuf,
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
 };
 use Opcode::*;
 use Value::*;
 
 const U15_MAX: u16 = 32767;
 
+#[derive(Parser)]
+struct Options {
+    #[clap(short, long)]
+    load: Option<PathBuf>,
+    #[clap(short, long)]
+    save: Option<PathBuf>,
+}
 fn main() -> Result<()> {
-    let code = include_bytes!("../sources/challenge.bin");
-    // let memory: HashMap<u16, Word> = code
-    let mut memory = [0; u16::MAX as usize + 1];
-    code
-        .chunks_exact(2)
-        .enumerate()
-        .for_each(|(i, tuple)| memory[i] = tuple[0] as u16 + ((tuple[1] as u16) << 8));
-        // .enumerate()
-        // .map(|(i, p)| (i as u16, p))
-        // .collect();
-    let mut machine = VirtualMachine {
-        registers: [0; 8],
-        memory, //: [9, 32768, 32769, 4, 19, 32768, 0]
-        // .into_iter()
-        // .enumerate()
-        // .map(|(i, p)| (i as u16, p))
-        // .collect(),
-        stack: Vec::new(),
-        pc: 0,
-        running: true,
+    let exit: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    {
+        let exit = exit.clone();
+        ctrlc::set_handler(move || {
+            exit.store(true, Ordering::Relaxed);
+        }).expect("set ctrl+c handler");
+    }
+    let options = Options::parse();
+    let mut machine = if let Some(path) = &options.load {
+        let file = std::fs::File::open(path)?;
+        serde_json::from_reader(file)?
+    } else {
+        let code = include_bytes!("../sources/challenge.bin");
+
+        let mut memory = [0; u16::MAX as usize + 1];
+        code.chunks_exact(2)
+            .enumerate()
+            .for_each(|(i, tuple)| memory[i] = tuple[0] as u16 + ((tuple[1] as u16) << 8));
+        let machine = VirtualMachine {
+            registers: [0; 8],
+            memory,
+            stack: Vec::new(),
+            pc: 0,
+            running: true,
+        };
+        machine
     };
-    while machine.running {
-        machine.step()?
+    while !exit.load(Ordering::Relaxed) && machine.running {
+        machine.step()?;
+    }
+    if let Some(path) = &options.save {
+        let file = std::fs::File::create(path)?;
+        serde_json::to_writer(file, &machine)?;
     }
 
     Ok(())
 }
 
-#[derive(Clone)]
+type MemoryArray = [Word; u16::MAX as usize + 1];
+#[derive(Serialize, Deserialize)]
 struct VirtualMachine {
     registers: [Word; 8],
-    memory: [Word; u16::MAX as usize + 1],
-    // memory: HashMap<u16, Word>,
+    #[serde(with = "Memory")]
+    memory: MemoryArray,
     stack: Vec<Word>,
     pc: u16,
     running: bool,
@@ -76,7 +101,7 @@ impl VirtualMachine {
             Mod(a, b, c) => self[a] = self.index(b) % self.index(c),
             And(a, b, c) => self[a] = self.index(b) & self.index(c),
             Or(a, b, c) => self[a] = self.index(b) | self.index(c),
-            Not(a, b) => self[a] = !(1<<15) & !self.index(b),
+            Not(a, b) => self[a] = !(1 << 15) & !self.index(b),
             Rmem(a, b) => self[a] = self.memory[self.index(b) as usize],
             Wmem(a, b) => {
                 let a = self.index(a) as usize;
@@ -122,7 +147,6 @@ impl VirtualMachine {
             3 => Pop(self.register(a)?),
             4 => Eq(self.register(a)?, self.value(b)?, self.value(c)?),
             5 => Gt(self.register(a)?, self.value(b)?, self.value(c)?),
-            //use get_memory for jump targets?
             6 => Jmp(self.value(a)?),
             7 => Jt(self.value(a)?, self.value(b)?),
             8 => Jf(self.value(a)?, self.value(b)?),
@@ -134,7 +158,6 @@ impl VirtualMachine {
             14 => Not(self.register(a)?, self.value(b)?),
             15 => Rmem(self.register(a)?, self.value(b)?),
             16 => Wmem(self.value(a)?, self.value(b)?),
-            // get_memory like in jump?
             17 => Call(self.value(a)?),
             18 => Ret,
             19 => Out(self.value(a)?),
@@ -146,8 +169,6 @@ impl VirtualMachine {
 
     fn get_memory(&self, mem: u16) -> Result<Word> {
         Ok(self.memory.get(mem as usize).copied().unwrap_or(0))
-        //for now default returning 0
-        // .map_or(Err(Error::MemoryOutOfBounds(mem)), |x| Ok(*x))
     }
 
     fn register(&self, mem: u16) -> Result<usize> {
@@ -159,7 +180,10 @@ impl VirtualMachine {
     }
 
     fn value(&self, mem: u16) -> Result<Value> {
-        let value = *self.memory.get(mem as usize).ok_or(Error::MemoryOutOfBounds(mem))?;
+        let value = *self
+            .memory
+            .get(mem as usize)
+            .ok_or(Error::MemoryOutOfBounds(mem))?;
         if value <= 32767 {
             Ok(Immediate(value))
         } else if value <= 32775 {
@@ -243,6 +267,19 @@ enum Error {
     InvalidOpCode(Word),
     PopOnEmptyStack,
     EndOfFile,
+    IOError,
+    SerdeError,
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(_: serde_json::Error) -> Self {
+        Self::IOError
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(_: std::io::Error) -> Self {
+        Self::SerdeError
+    }
 }
 
 impl std::error::Error for Error {}
@@ -257,6 +294,8 @@ impl std::fmt::Display for Error {
             InvalidOpCode(w) => write!(f, "{} is not a valid opcode", w),
             PopOnEmptyStack => write!(f, "pop on empty stack"),
             EndOfFile => write!(f, "encountered EOF while trying to read input"),
+            IOError => write!(f, "IOError"),
+            SerdeError => write!(f, "SerdeError"),
         }
     }
 }
@@ -266,4 +305,53 @@ impl std::fmt::Debug for Error {
         <Self as std::fmt::Display>::fmt(self, f)
     }
 }
+trait Memory<'de>: Sized {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer;
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>;
+}
+impl<'de> Memory<'de> for MemoryArray {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_tuple(self.len())?;
+        let max = self.iter().rposition(|&x| x != 0).unwrap_or(0);
+        for elem in &self[..=max] {
+            seq.serialize_element(elem)?;
+        }
+        seq.end()
+    }
 
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ArrayVisitor;
+        impl<'de> Visitor<'de> for ArrayVisitor {
+            type Value = MemoryArray;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(formatter, "an array of {} elements", Word::MAX as usize + 1)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<MemoryArray, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut memory = [0; u16::MAX as usize + 1];
+                let mut i = 0;
+                while let Some(val) = seq.next_element()? {
+                    memory[i] = val;
+                    i += 1;
+                }
+                Ok(memory)
+            }
+        }
+
+        deserializer.deserialize_tuple(Word::MAX as usize + 1, ArrayVisitor)
+    }
+}
